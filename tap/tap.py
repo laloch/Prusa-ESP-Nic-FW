@@ -17,14 +17,15 @@ IFF_NO_PI = 0x1000
 
 MSG_DEVINFO = 0
 MSG_LINK = 1
-MSG_CLIENTCONFIG = 2
-MSG_PACKET = 3
+MSG_GET_LINK = 2
+MSG_CLIENTCONFIG = 3
+MSG_PACKET = 4
 
-INTRON = b"UNU"
+INTRON = b"UNU\x01"
 INTERFACE = "tap0"
-BAUD_RATE = 927600
-SSID = "ssid"
-PASS = "pass"
+BAUD_RATE = 1500000 #921600
+SSID = "free_porn"
+PASS = "BensonHedges"
 
 # tap = Path('/dev/net/tun').open('r+b')
 tap = os.open("/dev/net/tun", 0x2)
@@ -34,7 +35,7 @@ fcntl.ioctl(tap, TUNSETIFF, ifr)
 fcntl.ioctl(tap, TUNSETOWNER, os.getuid())
 
 
-ser = serial.Serial("/dev/ttyUSB0", BAUD_RATE)
+ser = serial.Serial("/dev/ttyUSB0", baudrate=BAUD_RATE, parity=serial.PARITY_NONE)
 
 
 def safe(b: bytes):
@@ -129,6 +130,7 @@ Thread(target=serial_thread, daemon=True).start()
 print("TAP: Configuring wifi")
 send_wifi_client()
 
+i = 0;
 print("TAP: Reading tap device")
 while True:
     packet = os.read(tap, 2048)
@@ -146,5 +148,16 @@ while True:
     # print(f"TAP: SOUT MESSAGE: {out}")
     ser.write(out)
     ser.flush()
+
+    #i += 1
+    if i == 100:
+        i = 0
+        out = (
+            INTRON
+            + MSG_GET_LINK.to_bytes(1, "little")
+        )
+        ser.write(out)
+        ser.flush()
+
 
 tap.close()
