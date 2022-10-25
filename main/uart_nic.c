@@ -99,6 +99,10 @@ static const uint32_t INACTIVE_PACKET_SECONDS = 5;
 // new intron as uint8_t[8]
 #define MSG_INTRON 5
 
+#define MSG_START_SOFTAP 6
+
+#define MSG_ALIVE 7
+
 static const uint8_t uart_nic_protocol = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
 
 static const char *TAG = "uart_nic";
@@ -123,6 +127,8 @@ static bool beacon_quirk;
 static uint8_t probe_max_reties = 3;
 static atomic_bool probe_in_progress = false;
 static uint8_t probe_retry_count;
+
+static bool ap_silent = false;
 
 typedef struct {
     size_t len;
@@ -249,6 +255,51 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
    }
 }
 
+
+static void send_alive(const uint8_t code) {
+    const uint8_t d[2] = {
+        MSG_ALIVE, code,
+    };
+    xSemaphoreTake(uart_mtx, portMAX_DELAY);
+    uart_write_bytes(UART_NUM_0, intron, sizeof(intron));
+    uart_write_bytes(UART_NUM_0, (const char*)d, 2);
+    xSemaphoreGive(uart_mtx);
+}
+
+static void ap_task() {
+    esp_wifi_get_mac(WIFI_IF_AP, mac);
+    uint8_t data[64] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,    //dst MAC
+        0, 0, 0, 0, 0, 0,                      //src MAC
+        0, 46,                                 //length
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0                                //FCS
+    };
+    memcpy(&data[6], mac, 6);
+    uint32_t count = 0;
+    while (true) {
+        if (++count % 100 == 0) {
+            send_alive(41);
+        }
+        esp_wifi_internal_tx(ESP_IF_WIFI_AP, data, 64);
+        vTaskDelay(2);
+    }
+}
+
+static void ap_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    static TaskHandle_t xHandle = NULL;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
+        send_alive(40);
+        if (!ap_silent)
+            xTaskCreate(&ap_task, "softap", 1024, NULL, tskIDLE_PRIORITY + 1, &xHandle);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STOP) {
+        if (xHandle) {
+            vTaskDelete(xHandle);
+            xHandle = NULL;
+        }
+    }
+}
+
 static int IRAM_ATTR wifi_receive_cb(void *buffer, uint16_t len, void *eb) {
     // Seeing some traffic - we have signal :-)
     last_inbound_seen = now_seconds();
@@ -334,6 +385,45 @@ static void IRAM_ATTR wait_for_intron() {
         }
     }
     // ESP_LOGI(TAG, "Intron found");
+}
+
+static void start_softap(uint8_t channel) {
+    s_retry_num = CONFIG_ESP_MAXIMUM_RETRY;
+
+    if (channel > 100) {
+        ap_silent = true;
+        channel -= 100;
+    } else {
+        ap_silent = false;
+    }
+    send_alive(10);
+    esp_wifi_deinit();
+
+    tcpip_adapter_init();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &ap_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = "_test",
+            .ssid_len = 5,
+            .channel = channel,
+            .password = "",
+            .ssid_hidden = 1,
+            .max_connection = 5,
+            .authmode = WIFI_AUTH_OPEN,
+            .beacon_interval = 100
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    send_alive(20);
 }
 
 /**
@@ -440,6 +530,16 @@ static void IRAM_ATTR read_intron_message() {
     read_uart((uint8_t*)intron, sizeof(intron));
 }
 
+static void read_softap_message() {
+    uint8_t channel;
+    read_uart(&channel, 1);
+    if (channel == 255) {
+        esp_restart();
+    } else {
+        start_softap(channel);
+    }
+}
+
 static int get_link_status() {
     static wifi_ap_record_t ap_info;
     esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
@@ -496,6 +596,9 @@ static void IRAM_ATTR read_message() {
         send_link_status(get_link_status());
     } else if (type == MSG_INTRON) {
         read_intron_message();
+    } else if (type == MSG_START_SOFTAP) {
+        send_alive(99);
+        read_softap_message();
     } else {
         ESP_LOGI(TAG, "Unknown message type: %d !!!", type);
     }
